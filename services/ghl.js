@@ -4,13 +4,38 @@ import dotenv from "dotenv";
 import { saveTokens, loadTokens, saveLocationId, getLocationId } from "./../tokenStore.js";
 
 dotenv.config();
-let lastConversataionID = null;
-let lastMessage = null;
-let messageSentTime = null;
+
 const TOKEN_URL = "https://services.leadconnectorhq.com/oauth/token";
 const API_BASE = "https://services.leadconnectorhq.com";
 
 let tokenCache = loadTokens();
+
+// Dedup store: Map<conversationId, { message, sentAt }>
+// Keyed per conversation so concurrent conversations don't clobber each other.
+const dedupMap = new Map();
+const DEDUP_TTL_MS = 10_000;
+
+function isDuplicate(conversationId, message) {
+  const entry = dedupMap.get(conversationId);
+  if (!entry) return false;
+  if (Date.now() - entry.sentAt > DEDUP_TTL_MS) {
+    dedupMap.delete(conversationId);
+    return false;
+  }
+  return entry.message === message;
+}
+
+function recordSent(conversationId, message) {
+  dedupMap.set(conversationId, { message, sentAt: Date.now() });
+}
+
+// Periodically purge expired dedup entries to avoid memory growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of dedupMap) {
+    if (now - entry.sentAt > DEDUP_TTL_MS) dedupMap.delete(id);
+  }
+}, 5_000);
 
 /**
  * Exchange OAuth "code" for access + refresh token
@@ -79,27 +104,23 @@ async function refreshTokenIfNeeded() {
  * Generic GHL API caller
  */
 export async function callGHLApi(endpoint, method = "GET", data = {}) {
-  console.log("CallGHLapi Data" + JSON.stringify(data, null, 2));
   const accessToken = await refreshTokenIfNeeded();
-  const headers = { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json", Version: "2021-07-28" };
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    Version: "2021-07-28"
+  };
 
+  // Log request details without exposing the bearer token
   console.log("📤 GHL Request:", JSON.stringify({
     url: `${API_BASE}${endpoint}`,
     method,
-    headers,
     data
   }, null, 2));
 
   try {
-    const resp = await axios({
-      url: `${API_BASE}${endpoint}`,
-      method,
-      headers,
-      data,
-    });
-
+    const resp = await axios({ url: `${API_BASE}${endpoint}`, method, headers, data });
     return resp.data;
-
   } catch (err) {
     console.log("❌ GHL Error:", err.response?.data || err.message);
     throw err;
@@ -111,27 +132,23 @@ export async function callGHLApi(endpoint, method = "GET", data = {}) {
  */
 export async function upsertContact(phone, name = "") {
   const locationId = getLocationId();
-  console.log("Location ID from Upsertcontact function " + locationId);
   if (!locationId) throw new Error("Missing locationId in token store. Ensure GHL OAuth completed.");
-  const body = {
-    locationId,
-    phone,
-    name: name || "",
-  };
+  const body = { locationId, phone, name: name || "" };
   return callGHLApi("/contacts/upsert", "POST", body);
 }
 
 /**
- * Send an inbound message into a GHL conversation.
- * Bug fix: conversationid added as third param so the dedup guard compares real values.
+ * Log an inbound SMS into a GHL conversation (message received from customer).
+ *
+ * GHL Conversation Provider API uses /conversations/messages/inbound for ALL
+ * provider-sourced messages. The `direction` field ("inbound"/"outbound") tells
+ * GHL which way the message flowed — it does not change the endpoint.
  */
-export async function sendMessageToGHL(contactId, message, conversationid) {
-  if (message === lastMessage && conversationid === lastConversataionID) {
+export async function sendMessageToGHL(contactId, message, conversationId) {
+  if (isDuplicate(conversationId, message)) {
     console.log("⚠️ Duplicate inbound message detected — skipping.");
     return;
   }
-  const locationId = getLocationId();
-  console.log("Location ID from sendMessageToGHL function " + locationId);
   const body = {
     type: "SMS",
     conversationProviderId: "6925fd0c527ff0b8f1e92b60",
@@ -141,18 +158,21 @@ export async function sendMessageToGHL(contactId, message, conversationid) {
     date: new Date().toISOString()
   };
   const result = await callGHLApi("/conversations/messages/inbound", "POST", body);
-  // Update dedup state so the next identical event is caught
-  await saveConversationMessage(conversationid, message);
+  recordSent(conversationId, message);
   return result;
 }
 
-export async function sendOutboundToGHL(contactId, message, conversationid) {
-  if (message === lastMessage && conversationid === lastConversataionID) {
+/**
+ * Log an outbound SMS into a GHL conversation (message sent from GHL/agent).
+ *
+ * Same /inbound endpoint as above — GHL provider API design uses this endpoint
+ * for both directions; direction is communicated via the `direction` field.
+ */
+export async function sendOutboundToGHL(contactId, message, conversationId) {
+  if (isDuplicate(conversationId, message)) {
     console.log("⚠️ Duplicate outbound message detected — skipping.");
     return;
   }
-  const locationId = getLocationId();
-  console.log("Location ID from sendOutboundToGHL function " + locationId);
   const body = {
     type: "SMS",
     conversationProviderId: "6925fd0c527ff0b8f1e92b60",
@@ -162,26 +182,10 @@ export async function sendOutboundToGHL(contactId, message, conversationid) {
     date: new Date().toISOString()
   };
   const result = await callGHLApi("/conversations/messages/inbound", "POST", body);
-  // Update dedup state so the next identical event is caught
-  await saveConversationMessage(conversationid, message);
+  recordSent(conversationId, message);
   return result;
 }
 
 export async function getContactDetails(contactId) {
   return callGHLApi(`/contacts/${contactId}`, "GET");
 }
-
-export async function saveConversationMessage(conversationID, message) {
-  lastConversataionID = conversationID;
-  lastMessage = message;
-  messageSentTime = Date.now();
-}
-
-// Auto-reset dedup state after 10 seconds of inactivity
-setInterval(() => {
-  if (messageSentTime && Date.now() - messageSentTime > 10000) {
-    messageSentTime = null;
-    lastMessage = null;
-    lastConversataionID = null;
-  }
-}, 3000);
