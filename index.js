@@ -18,9 +18,22 @@ import {
 
 dotenv.config();
 
-// ✅ Express initialization MUST be at the top
 const app = express();
 app.use(bodyParser.json());
+
+// In-memory idempotency set for GHL webhook events.
+// Stores messageId values seen in the last MAX_IDS entries to prevent
+// duplicate processing when GHL retries a webhook delivery.
+const MAX_IDS = 500;
+const seenGhlMessageIds = new Set();
+
+function markSeen(id) {
+  seenGhlMessageIds.add(id);
+  if (seenGhlMessageIds.size > MAX_IDS) {
+    // Drop the oldest entry to keep memory bounded
+    seenGhlMessageIds.delete(seenGhlMessageIds.values().next().value);
+  }
+}
 
 /////////////////////////////////////////////////
 // Home
@@ -43,8 +56,8 @@ app.get("/oauth/start", (req, res) => {
     "locations.readonly",
     "users.readonly"
   ].join(" ");
-  
-   const authURL = `https://marketplace.gohighlevel.com/oauth/chooselocation?response_type=code&redirect_uri=${process.env.GHL_REDIRECT_URI}&client_id=${process.env.GHL_CLIENT_ID}&scope=${scopes}`;
+
+  const authURL = `https://marketplace.gohighlevel.com/oauth/chooselocation?response_type=code&redirect_uri=${process.env.GHL_REDIRECT_URI}&client_id=${process.env.GHL_CLIENT_ID}&scope=${scopes}`;
   res.redirect(authURL);
 });
 
@@ -102,14 +115,12 @@ app.get("/test-contact", async (req, res) => {
 /////////////////////////////////////////////////
 app.post("/webhook/podium", async (req, res) => {
   try {
-    res.sendStatus(200);
     console.log("📩 Podium Webhook Received:", req.body);
-
 
     const payload = req.body;
     const data = payload.data || payload;
 
-    const eventType = payload?.metadata.eventType || null;
+    const eventType = payload?.metadata?.eventType || null;
 
     const phoneNumber = data?.conversation?.channel?.identifier;
     const message = data?.body;
@@ -121,12 +132,12 @@ app.post("/webhook/podium", async (req, res) => {
     }
 
     const contact = await upsertContact(phoneNumber, name);
-    console.log("eventType " + eventType) 
+    console.log("eventType " + eventType);
     const isOutbound = eventType === "message.sent";
     const isInbound  = eventType === "message.received";
 
-    console.log("Is Inbound? " + isInbound)
-    console.log("Is Outbound? " + isOutbound)
+    console.log("Is Inbound? " + isInbound);
+    console.log("Is Outbound? " + isOutbound);
 
     if (isInbound) {
       console.log("📥 INBOUND from Podium → GHL");
@@ -138,58 +149,14 @@ app.post("/webhook/podium", async (req, res) => {
       await sendOutboundToGHL(contact.contact.id, message, data.conversation.uid);
     }
 
-    // await sendMessageToGHL(contact.contact.id, message);
-
     console.log("✅ Message forwarded to GHL.");
-    
+    return res.sendStatus(200);
 
   } catch (err) {
     console.error("❌ Podium Webhook Error:", err.message);
     return res.sendStatus(200);
   }
 });
-
-// app.post("/webhook/podium", async (req, res) => {
-//   try {
-//     console.log("📩 Podium Webhook Received:", req.body);
-
-//     let payload = req.body;
-
-//     // Support both:
-//     // A → { data: {...}, metadata: {...} }
-//     // B → { body: "...", conversation: {...} }
-//     const data = payload.data || payload;
-
-//     const phoneNumber = data?.conversation?.channel?.identifier;
-//     const message = data?.body;
-//     const name = data?.contactName || data?.contact?.name || "Podium User";
-
-//     console.log("➡ Extracted Phone:", phoneNumber);
-//     console.log("➡ Extracted Message:", message);
-//     console.log("➡ Extracted Name:", name);
-
-//     // Ignore test pings or invalid events
-//     if (!phoneNumber || !message) {
-//       console.log("⚠️ Missing phone or message — ignoring event.");
-//       return res.sendStatus(200);
-//     }
-
-//     // Upsert contact into GHL
-//     const contact = await upsertContact(phoneNumber, name);
-//     console.log("📌 Upsert Result:", JSON.stringify(contact));
-
-//     // FIX: correct date format for GHL inbound
-//     await sendMessageToGHL(contact.contact.id, message);
-
-//     console.log("✅ Message pushed to GHL");
-//     return res.sendStatus(200);
-
-//   } catch (err) {
-//     console.error("❌ Podium Webhook Error:", err.message);
-//     return res.sendStatus(200); // Prevent Podium retries
-//   }
-// });
-
 
 /////////////////////////////////////////////////
 // GHL → Podium Webhook
@@ -200,26 +167,36 @@ app.post("/webhook/ghl", async (req, res) => {
   console.log("══════════════════════════════════════════");
   console.log("📦 Raw Body:", JSON.stringify(req.body, null, 2));
 
-  const { phone, message, contactId } = req.body;
+  const { phone, message, contactId, messageId } = req.body;
+
+  // Idempotency check — GHL retries deliver the same messageId; ignore replays.
+  if (messageId && seenGhlMessageIds.has(messageId)) {
+    console.log(`⚠️ [GHL→Podium] Duplicate messageId=${messageId} — ignoring replay.`);
+    return res.sendStatus(200);
+  }
 
   console.log("🔍 Extracted Fields:");
   console.log("   phone     →", phone || "⚠️ MISSING");
   console.log("   message   →", message || "⚠️ MISSING");
   console.log("   contactId →", contactId || "⚠️ MISSING");
+  console.log("   messageId →", messageId || "⚠️ MISSING");
 
-  // ── Validate required fields ──
   if (!phone || !message || !contactId) {
     const missing = [];
     if (!phone) missing.push("phone");
     if (!message) missing.push("message");
     if (!contactId) missing.push("contactId");
     console.log(`❌ [GHL→Podium] REJECTED — Missing fields: ${missing.join(", ")}`);
-    return res.status(400).json({
+    // Return 200 so GHL does not retry a malformed payload indefinitely
+    return res.status(200).json({
       error: "Missing required fields",
       missing,
       received: req.body
     });
   }
+
+  // Mark as seen before processing so a concurrent retry is also dropped
+  if (messageId) markSeen(messageId);
 
   // ── Step 1: Get contact details from GHL ──
   let getcontact;
@@ -233,7 +210,8 @@ app.post("/webhook/ghl", async (req, res) => {
     console.log("   ❌ GHL getContactDetails FAILED");
     console.log("   Status:", err.response?.status);
     console.log("   Error:", JSON.stringify(err.response?.data || err.message, null, 2));
-    return res.status(500).json({
+    // Return 200 to prevent GHL from retrying — error is logged above
+    return res.status(200).json({
       error: "Failed to fetch contact from GHL",
       step: "getContactDetails",
       contactId,
@@ -260,7 +238,8 @@ app.post("/webhook/ghl", async (req, res) => {
     console.log("   Error Body:", JSON.stringify(err.response?.data || err.message, null, 2));
     console.log("   Headers:", JSON.stringify(err.response?.headers || {}, null, 2));
     console.log("══════════════════════════════════════════\n");
-    return res.status(500).json({
+    // Return 200 to prevent GHL from retrying and sending a duplicate message
+    return res.status(200).json({
       error: "Failed to send message to Podium",
       step: "sendToPodium",
       phone,
