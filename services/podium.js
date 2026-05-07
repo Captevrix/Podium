@@ -80,36 +80,43 @@ export async function podiumCallback(req, res) {
 }
 
 /**
- * Send an outbound SMS via Podium (Osender).
+ * Send an outbound SMS via Podium.
  *
- * Called from index.js when GHL fires a /webhook/ghl event and we need to
- * deliver the agent's reply back to the customer through Podium.
+ * Endpoint: POST /v4/messages
+ * Docs: https://docs.podium.com/reference/messagesend-1
  *
- * @param {string} phone       - Customer phone number (E.164 or local format)
+ * Required fields per the API spec:
+ *   body          — message text
+ *   channel       — { identifier: <phone>, type: "phone" }
+ *   locationUid   — Podium location UID (set PODIUM_LOCATION_UID in .env)
+ *
+ * Optional:
+ *   contactName   — updates/creates the contact display name in Podium
+ *   senderName    — label shown under the sent message in the Podium inbox
+ *   setOpenInbox  — move conversation to open inbox (default false)
+ *
+ * @param {string} phone       - Customer phone number (E.164 preferred; non-US must include country code)
  * @param {string} message     - Message text to send
- * @param {string} contactName - Customer display name (used for contact lookup/creation)
+ * @param {string} contactName - Customer display name
  */
 export async function sendToPodium(phone, message, contactName) {
+  const locationUid = process.env.PODIUM_LOCATION_UID;
+  if (!locationUid) throw new Error("Missing PODIUM_LOCATION_UID env var");
+
   const accessToken = await refreshPodiumTokenIfNeeded();
 
-  // Log without token
-  console.log("📤 Podium Request: sendToPodium", { phone, contactName, messageLength: message?.length });
-
-  // Podium messages are sent via the messages endpoint.
-  // The orgUid is required — set PODIUM_ORG_UID in .env from your Podium account.
-  const orgUid = process.env.PODIUM_ORG_UID;
-  if (!orgUid) throw new Error("Missing PODIUM_ORG_UID env var");
+  console.log("📤 Podium sendToPodium", { phone, contactName, messageLength: message?.length });
 
   const body = {
-    type: "TEXT",
     body: message,
-    // Podium needs either a locationUid or an existing conversation uid.
-    // Set PODIUM_LOCATION_UID in .env to your Podium location/inbox uid.
-    locationUid: process.env.PODIUM_LOCATION_UID,
-    customer: {
-      name: contactName || "",
-      phoneNumber: phone,
+    channel: {
+      identifier: phone,
+      type: "phone",
     },
+    locationUid,
+    contactName: contactName || undefined,
+    senderName: process.env.PODIUM_SENDER_NAME || undefined,
+    setOpenInbox: true,
   };
 
   try {
@@ -123,7 +130,7 @@ export async function sendToPodium(phone, message, contactName) {
         },
       }
     );
-    console.log("✅ Podium message sent:", resp.data?.uid || resp.status);
+    console.log("✅ Podium message sent:", resp.data?.data?.uid || resp.status);
     return resp.data;
   } catch (err) {
     console.error("❌ Podium sendToPodium error:", err.response?.data || err.message);
