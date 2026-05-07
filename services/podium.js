@@ -137,3 +137,49 @@ export async function sendToPodium(phone, message, contactName) {
     throw err;
   }
 }
+
+/**
+ * One-time setup: register the /webhook/podium endpoint with Podium.
+ *
+ * Endpoint: POST /v4/webhooks
+ * Docs: https://docs.podium.com/reference/webhookcreate-1
+ *
+ * Requires PODIUM_LOCATION_UID and a completed Podium OAuth flow.
+ * The secret returned by Podium is what you set as PODIUM_WEBHOOK_SECRET in .env.
+ *
+ * Call GET /setup/register-webhook once after OAuth is complete.
+ */
+export async function registerPodiumWebhook() {
+  const locationUid = process.env.PODIUM_LOCATION_UID;
+  if (!locationUid) throw new Error("Missing PODIUM_LOCATION_UID env var");
+
+  const webhookUrl = process.env.PODIUM_WEBHOOK_URL;
+  if (!webhookUrl) throw new Error("Missing PODIUM_WEBHOOK_URL env var (e.g. https://app.captevrix.com/webhook/podium)");
+
+  const accessToken = await refreshPodiumTokenIfNeeded();
+
+  const body = {
+    url: webhookUrl,
+    locationUid,
+    eventTypes: ["message.received", "message.sent"],
+    // Provide a secret so Podium signs every event — copy the returned
+    // secret into PODIUM_WEBHOOK_SECRET in your .env to enable verification.
+    secret: process.env.PODIUM_WEBHOOK_SECRET || undefined,
+  };
+
+  console.log("📤 Registering Podium webhook:", body);
+
+  const resp = await axios.post(
+    `${PODIUM_API_BASE}/webhooks`,
+    body,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  console.log("✅ Podium webhook registered:", resp.data);
+  return resp.data;
+}

@@ -14,7 +14,8 @@ import {
 
 import {
   podiumCallback,
-  sendToPodium
+  sendToPodium,
+  registerPodiumWebhook
 } from "./services/podium.js";
 
 dotenv.config();
@@ -157,6 +158,24 @@ app.get("/oauth/podium/start", (req, res) => {
 });
 
 app.get("/oauth/podium/callback", podiumCallback);
+
+/////////////////////////////////////////////////
+// One-time Podium webhook registration
+// Hit this once after completing Podium OAuth to register the webhook.
+// Protected by TEST_SECRET so it can't be triggered by anyone else.
+/////////////////////////////////////////////////
+app.get("/setup/register-webhook", async (req, res) => {
+  const secret = process.env.TEST_SECRET;
+  if (secret && req.query.secret !== secret) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  try {
+    const result = await registerPodiumWebhook();
+    res.json({ ok: true, webhook: result });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
 
 /////////////////////////////////////////////////
 // Test Contact API — protected by TEST_SECRET in production
