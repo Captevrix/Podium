@@ -2,6 +2,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import bodyParser from "body-parser";
+import crypto from "crypto";
 
 import {
   exchangeCodeForToken,
@@ -13,12 +14,30 @@ import {
 
 import {
   podiumCallback,
-  sendToPodium
+  sendToPodium,
+  registerPodiumWebhook
 } from "./services/podium.js";
 
 dotenv.config();
 
 const app = express();
+
+// Raw body buffer needed for Podium HMAC verification — must come before
+// bodyParser.json() so we can read the raw bytes on /webhook/podium.
+app.use((req, res, next) => {
+  if (req.path === "/webhook/podium") {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      req.rawBody = raw;
+      try { req.body = JSON.parse(raw); } catch { req.body = {}; }
+      next();
+    });
+  } else {
+    next();
+  }
+});
+
 app.use(bodyParser.json());
 
 // In-memory idempotency set for GHL webhook events.
@@ -30,16 +49,59 @@ const seenGhlMessageIds = new Set();
 function markSeen(id) {
   seenGhlMessageIds.add(id);
   if (seenGhlMessageIds.size > MAX_IDS) {
-    // Drop the oldest entry to keep memory bounded
     seenGhlMessageIds.delete(seenGhlMessageIds.values().next().value);
   }
+}
+
+/**
+ * Verify Podium webhook HMAC-SHA256 signature.
+ * Podium sends the signature in the x-podium-signature header as
+ * "sha256=<hex>". Set PODIUM_WEBHOOK_SECRET in .env to enable.
+ * If the secret is not configured the check is skipped (graceful degradation).
+ */
+function verifyPodiumSignature(req) {
+  const secret = process.env.PODIUM_WEBHOOK_SECRET;
+  if (!secret) return true;
+
+  const header = req.headers["x-podium-signature"] || "";
+  const [, receivedHex] = header.split("=");
+  if (!receivedHex) return false;
+
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(req.rawBody || "")
+    .digest("hex");
+
+  return crypto.timingSafeEqual(
+    Buffer.from(expected, "hex"),
+    Buffer.from(receivedHex, "hex")
+  );
+}
+
+/**
+ * Verify GHL webhook shared secret.
+ * GHL sends the secret in the x-ghl-signature or Authorization header
+ * depending on workflow config. Set GHL_WEBHOOK_SECRET in .env to enable.
+ * If the secret is not configured the check is skipped.
+ */
+function verifyGhlSignature(req) {
+  const secret = process.env.GHL_WEBHOOK_SECRET;
+  if (!secret) return true;
+
+  const provided =
+    req.headers["x-ghl-signature"] ||
+    req.headers["x-webhook-secret"] ||
+    req.headers["authorization"]?.replace("Bearer ", "") ||
+    "";
+
+  return provided === secret;
 }
 
 /////////////////////////////////////////////////
 // Home
 /////////////////////////////////////////////////
 app.get("/", (req, res) => {
-  res.send("<h1>🚀 GHL ↔ Podium Integration Server Running</h1>");
+  res.send("<h1>GHL &harr; Podium Integration Server Running</h1>");
 });
 
 /////////////////////////////////////////////////
@@ -69,14 +131,14 @@ app.get("/oauth/callback", async (req, res) => {
   }
 
   if (!code) {
-    return res.send("<h2>❌ No OAuth Code received from GHL.</h2>");
+    return res.send("<h2>No OAuth Code received from GHL.</h2>");
   }
 
   try {
     const tokens = await exchangeCodeForToken(code);
-    res.send(`<h2>✅ GHL Tokens Saved</h2><pre>${JSON.stringify(tokens, null, 2)}</pre>`);
+    res.send(`<h2>GHL Tokens Saved</h2><pre>${JSON.stringify(tokens, null, 2)}</pre>`);
   } catch (err) {
-    res.status(500).send(`<h2>❌ Token Exchange Error</h2><pre>${err.message}</pre>`);
+    res.status(500).send(`<h2>Token Exchange Error</h2><pre>${err.message}</pre>`);
   }
 });
 
@@ -98,9 +160,31 @@ app.get("/oauth/podium/start", (req, res) => {
 app.get("/oauth/podium/callback", podiumCallback);
 
 /////////////////////////////////////////////////
-// Test Contact API
+// One-time Podium webhook registration
+// Hit this once after completing Podium OAuth to register the webhook.
+// Protected by TEST_SECRET so it can't be triggered by anyone else.
+/////////////////////////////////////////////////
+app.get("/setup/register-webhook", async (req, res) => {
+  const secret = process.env.TEST_SECRET;
+  if (secret && req.query.secret !== secret) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  try {
+    const result = await registerPodiumWebhook();
+    res.json({ ok: true, webhook: result });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+/////////////////////////////////////////////////
+// Test Contact API — protected by TEST_SECRET in production
 /////////////////////////////////////////////////
 app.get("/test-contact", async (req, res) => {
+  const secret = process.env.TEST_SECRET;
+  if (secret && req.query.secret !== secret) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
   try {
     const { phone, name } = req.query;
     const contact = await upsertContact(phone, name);
@@ -114,6 +198,12 @@ app.get("/test-contact", async (req, res) => {
 // Podium → GHL Webhook
 /////////////////////////////////////////////////
 app.post("/webhook/podium", async (req, res) => {
+  // Verify Podium HMAC signature before processing
+  if (!verifyPodiumSignature(req)) {
+    console.warn("⚠️ [Podium] Invalid signature — rejecting request.");
+    return res.sendStatus(401);
+  }
+
   try {
     console.log("📩 Podium Webhook Received:", req.body);
 
@@ -149,6 +239,10 @@ app.post("/webhook/podium", async (req, res) => {
       await sendOutboundToGHL(contact.contact.id, message, data.conversation.uid);
     }
 
+    if (!isInbound && !isOutbound) {
+      console.log("ℹ️ Unrecognised eventType — no action taken.");
+    }
+
     console.log("✅ Message forwarded to GHL.");
     return res.sendStatus(200);
 
@@ -162,6 +256,12 @@ app.post("/webhook/podium", async (req, res) => {
 // GHL → Podium Webhook
 /////////////////////////////////////////////////
 app.post("/webhook/ghl", async (req, res) => {
+  // Verify GHL shared secret before processing
+  if (!verifyGhlSignature(req)) {
+    console.warn("⚠️ [GHL] Invalid signature — rejecting request.");
+    return res.sendStatus(401);
+  }
+
   console.log("\n══════════════════════════════════════════");
   console.log("📩 [GHL→Podium] Webhook received at", new Date().toISOString());
   console.log("══════════════════════════════════════════");
@@ -187,7 +287,6 @@ app.post("/webhook/ghl", async (req, res) => {
     if (!message) missing.push("message");
     if (!contactId) missing.push("contactId");
     console.log(`❌ [GHL→Podium] REJECTED — Missing fields: ${missing.join(", ")}`);
-    // Return 200 so GHL does not retry a malformed payload indefinitely
     return res.status(200).json({
       error: "Missing required fields",
       missing,
@@ -205,12 +304,10 @@ app.post("/webhook/ghl", async (req, res) => {
     console.log("   contactId:", contactId);
     getcontact = await getContactDetails(contactId);
     console.log("   ✅ Contact found:", getcontact.contact?.firstName, getcontact.contact?.lastName);
-    console.log("   📌 Full contact:", JSON.stringify(getcontact.contact, null, 2));
   } catch (err) {
     console.log("   ❌ GHL getContactDetails FAILED");
     console.log("   Status:", err.response?.status);
     console.log("   Error:", JSON.stringify(err.response?.data || err.message, null, 2));
-    // Return 200 to prevent GHL from retrying — error is logged above
     return res.status(200).json({
       error: "Failed to fetch contact from GHL",
       step: "getContactDetails",
@@ -228,7 +325,7 @@ app.post("/webhook/ghl", async (req, res) => {
     console.log("   message:", message);
     console.log("   contactName:", contactName);
 
-    const result = await sendToPodium(phone, message, contactName);
+    await sendToPodium(phone, message, contactName);
     console.log("   ✅ Podium accepted the message");
     console.log("══════════════════════════════════════════\n");
     return res.sendStatus(200);
@@ -236,9 +333,7 @@ app.post("/webhook/ghl", async (req, res) => {
     console.log("   ❌ Podium sendToPodium FAILED");
     console.log("   Status:", err.response?.status);
     console.log("   Error Body:", JSON.stringify(err.response?.data || err.message, null, 2));
-    console.log("   Headers:", JSON.stringify(err.response?.headers || {}, null, 2));
     console.log("══════════════════════════════════════════\n");
-    // Return 200 to prevent GHL from retrying and sending a duplicate message
     return res.status(200).json({
       error: "Failed to send message to Podium",
       step: "sendToPodium",
