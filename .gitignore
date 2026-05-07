@@ -1,6 +1,8 @@
 # Environment variables — never commit secrets
 .env
 .env.*
+# But the example template is safe to commit
+!.env.example
 
 # OAuth tokens — contains live access/refresh tokens
 tokens.json
